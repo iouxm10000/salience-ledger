@@ -8,6 +8,7 @@ from pathlib import Path
 from .models import AUTHORITIES, MEMORY_TYPES, ROLES, SALIENCE, STATUSES, MemoryRecord
 from .store import Ledger, LedgerError
 from .adapters.evos_v2 import import_jsonl
+from .migration.evos_v2 import EvosV2Migrator
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -64,6 +65,31 @@ def _parser() -> argparse.ArgumentParser:
         "import-evos-v2", help="import legacy JSONL into a non-authoritative review queue"
     )
     migration.add_argument("path")
+    full_migration = commands.add_parser(
+        "migrate-evos-v2",
+        help="preserve one immutable EvoS generation and create a semantic review queue",
+    )
+    full_migration.add_argument("--project-root", required=True)
+    migration_check = commands.add_parser(
+        "migration-check", help="verify evidence parity; cutover remains blocked by review"
+    )
+    migration_check.add_argument("--project-root", required=True)
+    migration_check.add_argument("--migration-id", required=True)
+    migration_check.add_argument(
+        "--current", action="store_true", help="also require current legacy semantic identity"
+    )
+    migration_check.add_argument("--cutover", action="store_true")
+    migration_review = commands.add_parser(
+        "migration-review", help="append one source-backed semantic migration disposition"
+    )
+    migration_review.add_argument("--project-root", required=True)
+    migration_review.add_argument("--migration-id", required=True)
+    migration_review.add_argument("--legacy-id", required=True)
+    migration_review.add_argument(
+        "--disposition", required=True, choices=["ARCHIVE_PRESERVED", "REJECTED", "PROMOTED"]
+    )
+    migration_review.add_argument("--review-episode", required=True)
+    migration_review.add_argument("--promoted-record")
     return parser
 
 
@@ -124,6 +150,39 @@ def main(argv: list[str] | None = None) -> int:
             print(store.recovery_context(args.query, limit=args.limit), end="")
         elif args.command == "import-evos-v2":
             print(json.dumps(import_jsonl(store, args.path), indent=2, ensure_ascii=False))
+        elif args.command == "migrate-evos-v2":
+            migrator = EvosV2Migrator(store, args.project_root)
+            manifest = migrator.migrate()
+            report = migrator.verify(manifest["migration_id"], require_current=True)
+            print(json.dumps({
+                "migration_id": manifest["migration_id"],
+                "manifest_path": str(
+                    store.state / "migrations" / manifest["migration_id"] / "migration_manifest.json"
+                ),
+                "legacy_generation_id": manifest["legacy_generation_id"],
+                "source_file_count": len(manifest["source_files"]),
+                "parity": report,
+            }, indent=2, ensure_ascii=False))
+        elif args.command == "migration-check":
+            report = EvosV2Migrator(store, args.project_root).verify(
+                args.migration_id, require_current=args.current or args.cutover
+            )
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            if (
+                report["evidence_parity"] != "PASS"
+                or ((args.current or args.cutover) and report["cutover_issues"])
+                or (args.cutover and not report["cutover_ready"])
+            ):
+                return 1
+        elif args.command == "migration-review":
+            result = EvosV2Migrator(store, args.project_root).review(
+                args.migration_id,
+                args.legacy_id,
+                args.disposition,
+                args.review_episode,
+                args.promoted_record,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
     except (LedgerError, ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

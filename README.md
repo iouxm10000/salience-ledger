@@ -65,9 +65,18 @@ and source episodes. Resolution requires a new observation whose `source_type` i
 `user_confirmation`; neither an agent inference nor an ordinary newer message can silently erase
 the older meaning.
 
+## Lossless legacy migration
+
+`migrate-evos-v2` preserves one immutable legacy generation and every SQLite row before any
+semantic promotion. Evidence parity, semantic parity, and cutover readiness are independent
+gates; the old store remains authoritative while review is pending. See the
+[migration guide](docs/migration.md).
+Codex projects should use the staged [integration contract](docs/codex-integration.md) so the
+legacy authority remains intact until review and cutover checks pass.
+
 ## Status
 
-`0.1.0` is an alpha reference implementation evolved from an internal predecessor named EvoS.
+`0.2.0` is an alpha reference implementation evolved from an internal predecessor named EvoS.
 It intentionally favors auditability and
 fail-closed behavior over autonomous LLM summarization. See [the architecture](docs/architecture.md)
 and [migration guide](docs/migration.md). The [design references](docs/design-references.md) state
