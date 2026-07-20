@@ -42,3 +42,12 @@ Cutover is forbidden unless the command exits zero. This requires:
 Only after explicit coordinator acceptance should `AGENTS.md` make Salience Ledger authoritative.
 Retain the frozen EvoS bundle indefinitely as provenance and rollback evidence; do not delete it
 after cutover.
+
+## Long-running tasks
+
+Install or invoke `skills/salience-supervise-task` for multi-round implementation, audit, or
+migration work. Create the run contract once, append validated task events, and re-run
+`task-context` after compaction or resume. A clean-context supervisor reads durable task state and
+Git evidence, not the executor's conversation transcript, and sends corrections only through the
+task directive channel. The skill does not grant permission to spawn agents, schedule work,
+commit, push, or create a Codex goal.

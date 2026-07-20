@@ -51,6 +51,11 @@ class EvosV2Migrator:
         self.project_root = Path(project_root).resolve()
         self.evos_root = self.project_root / "evos_memory"
 
+    def current_migration_id(self) -> str:
+        """Return the deterministic migration id for the verified current EvoS generation."""
+        source = self._resolve_source()
+        return f"evos-v2-{source['generation_id']}-{source['source_hash'][:12]}"
+
     def migrate(self) -> dict[str, Any]:
         source = self._resolve_source()
         migration_id = f"evos-v2-{source['generation_id']}-{source['source_hash'][:12]}"

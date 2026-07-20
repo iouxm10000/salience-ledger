@@ -37,3 +37,14 @@ in the journal.
 Recovery loads the fixed core sections first, then performs deterministic lexical retrieval over
 working and archive memory. Optional embedding or graph adapters may suggest additional records,
 but those results remain discovery hints and may not override the core.
+
+## Long-task supervision plane
+
+`.salience/task-runs/<run-id>/contract.json` freezes the goal, gates, completion criteria, scope,
+red lines, and mutation authorization. `events.jsonl` is a hash-chained handoff log shared by an
+executor and an independent clean-context supervisor. The executor closes one item per round; the
+supervisor can only append one-way corrective directives. Neither plane replaces memory evidence.
+
+`task-context` deterministically combines verified core memory with open task items, directives,
+owner blockers, and the last two verified rounds. It refuses to render when governing memory is
+ambiguous, so compaction recovery cannot silently choose a newer user statement.

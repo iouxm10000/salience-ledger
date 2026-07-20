@@ -18,6 +18,7 @@ counterexamples, and blockers that actually govern the work.
 - A permanent rejection cannot be revived by an engineering proposal.
 - Unresolved blockers and regression counterexamples can prevent a false `DONE`.
 - Builds publish immutable, hashed generations through an atomic `CURRENT.json` pointer.
+- Long tasks use immutable contracts, hash-chained rounds, and one-way supervisor directives.
 - The core is local and dependency-free; semantic retrieval is an optional discovery layer.
 
 ## Quick start
@@ -40,6 +41,17 @@ salience --root demo build
 salience --root demo context
 salience --root demo doctor --completion
 ```
+
+For work that spans multiple rounds or compactions:
+
+```bash
+salience --root demo task-init --run-id audit-one \
+  --goal "Close the audit with reproducible evidence" \
+  --gate "python -m unittest" --completion "all findings have code evidence"
+salience --root demo task-context --run-id audit-one
+```
+
+The Codex-native workflow is packaged in `skills/salience-supervise-task`.
 
 ## Recovery contract
 
@@ -76,7 +88,7 @@ legacy authority remains intact until review and cutover checks pass.
 
 ## Status
 
-`0.2.0` is an alpha reference implementation evolved from an internal predecessor named EvoS.
+`0.3.0` is an alpha reference implementation evolved from an internal predecessor named EvoS.
 It intentionally favors auditability and
 fail-closed behavior over autonomous LLM summarization. See [the architecture](docs/architecture.md)
 and [migration guide](docs/migration.md). The [design references](docs/design-references.md) state

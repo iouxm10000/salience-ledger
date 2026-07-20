@@ -83,6 +83,7 @@ class LosslessEvosMigrationTests(unittest.TestCase):
             migrator = EvosV2Migrator(ledger, project)
 
             manifest = migrator.migrate()
+            self.assertEqual(migrator.current_migration_id(), manifest["migration_id"])
             self.assertEqual(manifest["legacy_row_count"], 3)
             self.assertEqual(len(manifest["row_mappings"]), 3)
             self.assertEqual(len({item["ledger_id"] for item in manifest["row_mappings"]}), 3)
