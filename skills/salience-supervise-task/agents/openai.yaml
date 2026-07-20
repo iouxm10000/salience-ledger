@@ -1,0 +1,4 @@
+interface:
+  display_name: "Salience Task Supervisor"
+  short_description: "Keep long Codex tasks on-spec across compaction"
+  default_prompt: "Use $salience-supervise-task to run this long task with durable memory, one-item verification, and clean-context supervision."

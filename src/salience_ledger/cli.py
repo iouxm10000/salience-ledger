@@ -8,6 +8,8 @@ from pathlib import Path
 from .models import AUTHORITIES, MEMORY_TYPES, ROLES, SALIENCE, STATUSES, MemoryRecord
 from .store import Ledger, LedgerError
 from .adapters.evos_v2 import import_jsonl
+from .migration.evos_v2 import EvosV2Migrator
+from .task_runs import ACTORS, EVENT_ACTORS, TaskRun
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -64,6 +66,72 @@ def _parser() -> argparse.ArgumentParser:
         "import-evos-v2", help="import legacy JSONL into a non-authoritative review queue"
     )
     migration.add_argument("path")
+    full_migration = commands.add_parser(
+        "migrate-evos-v2",
+        help="preserve one immutable EvoS generation and create a semantic review queue",
+    )
+    full_migration.add_argument("--project-root", required=True)
+    migration_check = commands.add_parser(
+        "migration-check", help="verify evidence parity; cutover remains blocked by review"
+    )
+    migration_check.add_argument("--project-root", required=True)
+    migration_check.add_argument(
+        "--migration-id",
+        help="frozen migration id; with --current, omit to resolve it from current EvoS identity",
+    )
+    migration_check.add_argument(
+        "--current", action="store_true", help="also require current legacy semantic identity"
+    )
+    migration_check.add_argument("--cutover", action="store_true")
+    migration_review = commands.add_parser(
+        "migration-review", help="append one source-backed semantic migration disposition"
+    )
+    migration_review.add_argument("--project-root", required=True)
+    migration_review.add_argument("--migration-id", required=True)
+    migration_review.add_argument("--legacy-id", required=True)
+    migration_review.add_argument(
+        "--disposition", required=True, choices=["ARCHIVE_PRESERVED", "REJECTED", "PROMOTED"]
+    )
+    migration_review.add_argument("--review-episode", required=True)
+    migration_review.add_argument("--promoted-record")
+
+    task_init = commands.add_parser(
+        "task-init", help="create an immutable long-task contract and event chain"
+    )
+    task_init.add_argument("--run-id", required=True)
+    task_init.add_argument("--goal", required=True)
+    task_init.add_argument("--gate", action="append", required=True)
+    task_init.add_argument("--completion", action="append", required=True)
+    task_init.add_argument("--scope", action="append", default=[])
+    task_init.add_argument("--protect", action="append", default=[])
+    task_init.add_argument("--red-line", action="append", default=[])
+    task_init.add_argument("--commit-authorized", action="store_true")
+    task_init.add_argument("--push-authorized", action="store_true")
+    task_init.add_argument("--converge-every", type=int, default=5)
+    task_init.add_argument("--large-change-lines", type=int, default=400)
+    task_init.add_argument("--max-rounds", type=int, default=50)
+
+    task_event = commands.add_parser(
+        "task-event", help="append one validated executor/supervisor/owner event"
+    )
+    task_event.add_argument("--run-id", required=True)
+    task_event.add_argument("--actor", required=True, choices=sorted(ACTORS))
+    task_event.add_argument("--event-type", required=True, choices=sorted(EVENT_ACTORS))
+    event_payload = task_event.add_mutually_exclusive_group(required=True)
+    event_payload.add_argument("--payload-json")
+    event_payload.add_argument("--payload-file")
+
+    task_context = commands.add_parser(
+        "task-context", help="render compaction-safe memory plus active task state"
+    )
+    task_context.add_argument("--run-id", required=True)
+    task_context.add_argument("--query", default="")
+
+    task_doctor = commands.add_parser(
+        "task-doctor", help="verify event chain, memory ambiguity, directives and completion gates"
+    )
+    task_doctor.add_argument("--run-id", required=True)
+    task_doctor.add_argument("--completion", action="store_true")
     return parser
 
 
@@ -124,6 +192,78 @@ def main(argv: list[str] | None = None) -> int:
             print(store.recovery_context(args.query, limit=args.limit), end="")
         elif args.command == "import-evos-v2":
             print(json.dumps(import_jsonl(store, args.path), indent=2, ensure_ascii=False))
+        elif args.command == "migrate-evos-v2":
+            migrator = EvosV2Migrator(store, args.project_root)
+            manifest = migrator.migrate()
+            report = migrator.verify(manifest["migration_id"], require_current=True)
+            print(json.dumps({
+                "migration_id": manifest["migration_id"],
+                "manifest_path": str(
+                    store.state / "migrations" / manifest["migration_id"] / "migration_manifest.json"
+                ),
+                "legacy_generation_id": manifest["legacy_generation_id"],
+                "source_file_count": len(manifest["source_files"]),
+                "parity": report,
+            }, indent=2, ensure_ascii=False))
+        elif args.command == "migration-check":
+            migrator = EvosV2Migrator(store, args.project_root)
+            migration_id = args.migration_id
+            if migration_id is None:
+                if not args.current:
+                    raise LedgerError("--migration-id is required unless --current is used")
+                migration_id = migrator.current_migration_id()
+            report = migrator.verify(migration_id, require_current=args.current or args.cutover)
+            print(json.dumps(report, indent=2, ensure_ascii=False))
+            if (
+                report["evidence_parity"] != "PASS"
+                or ((args.current or args.cutover) and report["cutover_issues"])
+                or (args.cutover and not report["cutover_ready"])
+            ):
+                return 1
+        elif args.command == "migration-review":
+            result = EvosV2Migrator(store, args.project_root).review(
+                args.migration_id,
+                args.legacy_id,
+                args.disposition,
+                args.review_episode,
+                args.promoted_record,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "task-init":
+            result = TaskRun(store, args.run_id).initialize(
+                goal=args.goal,
+                gates=args.gate,
+                completion_criteria=args.completion,
+                scope_paths=args.scope,
+                protected_paths=args.protect,
+                red_lines=args.red_line,
+                commit_authorized=args.commit_authorized,
+                push_authorized=args.push_authorized,
+                converge_every=args.converge_every,
+                large_change_lines=args.large_change_lines,
+                max_rounds=args.max_rounds,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "task-event":
+            payload = json.loads(
+                args.payload_json
+                if args.payload_json is not None
+                else Path(args.payload_file).read_text(encoding="utf-8")
+            )
+            result = TaskRun(store, args.run_id).append(
+                actor=args.actor, event_type=args.event_type, payload=payload
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "task-context":
+            print(TaskRun(store, args.run_id).render_context(args.query), end="")
+        elif args.command == "task-doctor":
+            issues = TaskRun(store, args.run_id).audit(completion=args.completion)
+            if issues:
+                print("FAIL")
+                for issue in issues:
+                    print(f"- {issue}")
+                return 1
+            print("PASS")
     except (LedgerError, ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
