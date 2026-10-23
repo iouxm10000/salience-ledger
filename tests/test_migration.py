@@ -28,6 +28,17 @@ class MigrationTests(unittest.TestCase):
             second = import_jsonl(ledger, legacy)
             self.assertEqual(second, {"imported": 0, "skipped": 1})
 
+    def test_identical_legacy_rows_remain_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "legacy.jsonl"
+            row = json.dumps({"kind": "note", "text": "same"})
+            legacy.write_text(row + "\n" + row + "\n", encoding="utf-8")
+            ledger = Ledger(root / "project")
+            self.assertEqual(import_jsonl(ledger, legacy), {"imported": 2, "skipped": 0})
+            self.assertEqual(len(ledger.records()), 2)
+            self.assertEqual(import_jsonl(ledger, legacy), {"imported": 0, "skipped": 2})
+
 
 if __name__ == "__main__":
     unittest.main()

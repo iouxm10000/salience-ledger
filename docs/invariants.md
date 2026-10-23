@@ -15,3 +15,9 @@
 12. Generated bundles and their selection pointer are hash-verified.
 13. Core memory has a hard size budget; making everything important is treated as a fault.
 14. Public fixtures are synthetic and privacy-scanned.
+15. A long-task contract is immutable after initialization.
+16. Task events form a sequence-numbered SHA-256 chain.
+17. An execution round targets exactly one open item and records the exact contract gate set.
+18. Executors cannot write supervisor directives; supervisors cannot rewrite executor history.
+19. Task context fails closed while user clarification is required.
+20. Completion requires closed items, directives, owner decisions, blockers, and green latest gates.

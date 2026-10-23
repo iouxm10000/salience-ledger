@@ -21,7 +21,10 @@ def import_jsonl(ledger: Ledger, path: str | Path) -> dict[str, int]:
                 continue
             data: dict[str, Any] = json.loads(raw)
             canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            # Identity includes the source location. Two legacy rows may have identical
+            # content while remaining distinct evidence and must never be collapsed.
+            identity = f"{source}:{line_number}\n{canonical}"
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             identifier = f"legacy-{digest[:20]}"
             if identifier in known:
                 skipped += 1
@@ -29,7 +32,7 @@ def import_jsonl(ledger: Ledger, path: str | Path) -> dict[str, int]:
             episode_id = ledger.observe(
                 canonical,
                 source_type="legacy_evos_v2_record",
-                source_ref=f"{source.name}:{line_number}",
+                source_ref=f"{source}:{line_number}",
             )
             title = str(data.get("title") or data.get("id") or f"Legacy record {line_number}")
             text = str(data.get("summary") or data.get("text") or canonical)

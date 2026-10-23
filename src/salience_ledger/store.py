@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import tempfile
+import threading
+import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from .models import CORE_ORDER, MemoryRecord, parse_timestamp, utc_now
+
+if os.name == "nt":  # pragma: no cover - 平台分支
+    import msvcrt
+else:  # pragma: no cover - 平台分支
+    import fcntl
 
 
 ACTIVE_STATUSES = {"active", "accepted"}
@@ -30,8 +39,130 @@ class LedgerError(RuntimeError):
     pass
 
 
+_LOCKS_GUARD = threading.Lock()
+_ROOT_LOCKS: dict[str, threading.RLock] = {}
+_LOCK_DEPTH = threading.local()
+_LOCK_POLL_SECONDS = 0.005
+_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+def _root_rlock(root: str) -> threading.RLock:
+    """同一 root 一个进程内可重入锁（跨线程互斥、同线程可重入）。"""
+    with _LOCKS_GUARD:
+        lock = _ROOT_LOCKS.get(root)
+        if lock is None:
+            lock = threading.RLock()
+            _ROOT_LOCKS[root] = lock
+        return lock
+
+
+def _acquire_byte_lock(fd: int) -> None:
+    """Windows：非阻塞抢第 0 字节的锁，按 5ms 轮询直到超时。
+
+    不用 LK_LOCK：它的重试粒度是 1 秒、10 次后抛 EDEADLOCK，实测持锁
+    竞争下排队进程要白等 9 秒以上才失败。LK_NBLCK 立即返回，我们自己
+    控制轮询间隔与超时，排队延迟从「整秒」降到「毫秒」。
+    """
+    deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            # msvcrt.locking 从当前文件位置开始锁，每次尝试都要回到 0。
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise LedgerError(
+                    f"could not acquire write lock within {_LOCK_TIMEOUT_SECONDS:.0f}s: {exc}"
+                ) from exc
+            time.sleep(_LOCK_POLL_SECONDS)
+
+
+def _json_default(value: Any) -> Any:
+    """让 json.dumps 认识快照里的 mappingproxy。
+
+    快照为真正不可变，把 dict 换成了 MappingProxyType；json.dumps 不认它，
+    序列化时经这里降级成普通 dict。内层若还有 mappingproxy，json 会递归回调。
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _freeze_json(value: Any) -> Any:
+    """递归把 dict 换成 MappingProxyType、list 换成 tuple。
+
+    不用 dict/list 子类：父类的 C 方法能绕过子类覆写，实测
+    dict.__init__(frozen, ...)、dict.__setitem__(frozen, ...)、
+    list.__init__(frozen, ...)、list.__setitem__(frozen, ...) 全部能改内容，
+    连 d.__init__({...}) 这种常规写法都能改。
+    MappingProxyType 与 tuple 是 C 层只读，没有这条路径。
+    """
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class JournalSnapshot:
+    """一次读取得到的 journal 不可变快照。
+
+    records / episode_ids / observations 全部派生自同一份 raw 字节，
+    source_sha256 也是这份字节的哈希，因此三者与指纹必然同源：
+    不存在「审计读到的记录集」与「发布出去的记录集」不一致的窗口。
+
+    captured_at 在解析开始时取一次，供所有有效性判断共用，
+    避免同一次审计内部出现两个不同的 now。
+
+    不可变性分三层，缺一层都能被绕过：
+      1. frozen=True 阻止字段重绑定；
+      2. records / observations 外层包 MappingProxyType，阻止 clear()/增删键；
+      3. 每条 MemoryRecord 的 value 与各 list 字段递归换成
+         MappingProxyType / tuple，阻止「改记录内部容器」——
+         否则改掉 record.value 里的冲突字段，审计就会从报错变成通过，
+         而 raw 与 source_sha256 纹丝不动。
+    """
+
+    raw: bytes
+    source_sha256: str
+    records: Mapping[str, MemoryRecord]
+    episode_ids: frozenset[str]
+    observations: Mapping[str, Mapping[str, Any]]
+    captured_at: Any
+
+    def __post_init__(self) -> None:
+        frozen_records = {
+            record_id: replace(
+                record,
+                value=_freeze_json(record.value),
+                tags=tuple(record.tags),
+                supersedes=tuple(record.supersedes),
+                conflicts_with=tuple(record.conflicts_with),
+                source_episode_ids=tuple(record.source_episode_ids),
+            )
+            for record_id, record in self.records.items()
+        }
+        object.__setattr__(self, "records", MappingProxyType(frozen_records))
+        object.__setattr__(
+            self,
+            "observations",
+            MappingProxyType(
+                {key: _freeze_json(dict(value)) for key, value in self.observations.items()}
+            ),
+        )
+
+
+
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_default,
+    )
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -63,66 +194,123 @@ class Ledger:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
             self.events_path.touch()
 
+    @contextlib.contextmanager
+    def _write_lock(self):
+        """跨进程排他写锁，保护「查重 → 引用校验 → 状态检查 → 追加」整个临界区。
+
+        为什么必须是锁而不是乐观重试：journal 是 append-only，
+        两个写者可以同时通过查重、各追加一行完整记录，事后再怎么重读都
+        撤销不了已经落盘的那一行；随后任何人读库都会撞上重复 id。
+
+        可重入：supersede() 会连续调用 append()，同一线程内重入时
+        只做深度计数，不重复加解锁文件锁（msvcrt.locking 不按引用计数，
+        内层提前解锁会让外层失去保护）。
+        """
+        self.init()
+        key = str(self.root)
+        depth = getattr(_LOCK_DEPTH, "depth", None)
+        if depth is None:
+            depth = {}
+            _LOCK_DEPTH.depth = depth
+        if depth.get(key, 0) > 0:
+            depth[key] += 1
+            try:
+                yield
+            finally:
+                depth[key] -= 1
+            return
+
+        lock_path = self.state / "write.lock"
+        with _root_rlock(key):
+            # 锁文件必须用 O_CREAT 原子创建，绝不能「不存在就先写一个字节」：
+            # 实测 Windows 上另一进程已持有该字节锁时，open("wb") 截断直接 EACCES，
+            # 而 os.open(O_RDWR|O_CREAT) 仍能成功。空文件也能在第 0 字节加锁。
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                if os.name == "nt":
+                    _acquire_byte_lock(fd)
+                    depth[key] = 1
+                    try:
+                        yield
+                    finally:
+                        depth[key] = 0
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    fcntl.lockf(fd, fcntl.LOCK_EX)
+                    depth[key] = 1
+                    try:
+                        yield
+                    finally:
+                        depth[key] = 0
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        fcntl.lockf(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def observe(self, content: str, *, source_type: str, source_ref: str = "") -> str:
         """Append immutable source evidence before deriving a governing memory record."""
-        self.init()
-        if not content.strip() or not source_type.strip():
-            raise ValueError("observation content and source_type are required")
-        episode_id = f"ep-{uuid.uuid4().hex}"
-        observation = {
-            "schema_version": "salience_episode.v1",
-            "episode_id": episode_id,
-            "event": "observation",
-            "content": content,
-            "content_sha256": _sha256_bytes(content.encode("utf-8")),
-            "source_type": source_type,
-            "source_ref": source_ref,
-            "recorded_at": utc_now(),
-        }
-        self._append_episode(observation)
-        return episode_id
+        with self._write_lock():
+            if not content.strip() or not source_type.strip():
+                raise ValueError("observation content and source_type are required")
+            episode_id = f"ep-{uuid.uuid4().hex}"
+            observation = {
+                "schema_version": "salience_episode.v1",
+                "episode_id": episode_id,
+                "event": "observation",
+                "content": content,
+                "content_sha256": _sha256_bytes(content.encode("utf-8")),
+                "source_type": source_type,
+                "source_ref": source_ref,
+                "recorded_at": utc_now(),
+            }
+            self._append_episode(observation)
+            return episode_id
 
     def append(self, record: MemoryRecord, *, event: str = "upsert") -> str:
-        self.init()
-        record.validate()
-        existing = self.records().get(record.id)
-        if existing is not None:
-            old = existing.as_dict()
-            new = record.as_dict()
-            old_status, new_status = old.pop("status"), new.pop("status")
-            if old != new:
-                raise LedgerError(
-                    f"record id {record.id} is immutable; create a new id and explicitly resolve/supersede"
-                )
-            allowed = {
-                "active": {"resolved", "superseded", "rejected", "archived"},
-                "accepted": {"resolved", "superseded", "rejected", "archived"},
+        # 查重、引用校验、状态检查、追加必须在同一个临界区内完成，
+        # 否则两个写者可同时通过查重并各写一行，之后整库因重复 id 不可读。
+        with self._write_lock():
+            record.validate()
+            existing = self.records().get(record.id)
+            if existing is not None:
+                old = existing.as_dict()
+                new = record.as_dict()
+                old_status, new_status = old.pop("status"), new.pop("status")
+                if old != new:
+                    raise LedgerError(
+                        f"record id {record.id} is immutable; create a new id and explicitly resolve/supersede"
+                    )
+                allowed = {
+                    "active": {"resolved", "superseded", "rejected", "archived"},
+                    "accepted": {"resolved", "superseded", "rejected", "archived"},
+                }
+                if new_status not in allowed.get(old_status, set()):
+                    raise LedgerError(f"invalid status transition for {record.id}: {old_status} -> {new_status}")
+            known_episodes = self.episode_ids()
+            observations = self.observations()
+            if (record.salience == "core" or record.must_read) and not record.source_episode_ids:
+                raise LedgerError(f"core record {record.id} requires source_episode_ids")
+            missing = sorted(set(record.source_episode_ids) - known_episodes)
+            if missing:
+                raise LedgerError(f"record {record.id} references missing episodes: {', '.join(missing)}")
+            if record.salience == "core" or record.must_read:
+                non_observations = sorted(set(record.source_episode_ids) - set(observations))
+                if non_observations:
+                    raise LedgerError(
+                        f"core record {record.id} sources must be observations: {', '.join(non_observations)}"
+                    )
+            episode = {
+                "schema_version": "salience_episode.v1",
+                "episode_id": f"ep-{uuid.uuid4().hex}",
+                "event": event,
+                "record": record.as_dict(),
+                "record_sha256": _sha256_bytes(_canonical_json(record.as_dict()).encode("utf-8")),
+                "recorded_at": utc_now(),
             }
-            if new_status not in allowed.get(old_status, set()):
-                raise LedgerError(f"invalid status transition for {record.id}: {old_status} -> {new_status}")
-        known_episodes = self.episode_ids()
-        observations = self.observations()
-        if (record.salience == "core" or record.must_read) and not record.source_episode_ids:
-            raise LedgerError(f"core record {record.id} requires source_episode_ids")
-        missing = sorted(set(record.source_episode_ids) - known_episodes)
-        if missing:
-            raise LedgerError(f"record {record.id} references missing episodes: {', '.join(missing)}")
-        if record.salience == "core" or record.must_read:
-            non_observations = sorted(set(record.source_episode_ids) - set(observations))
-            if non_observations:
-                raise LedgerError(
-                    f"core record {record.id} sources must be observations: {', '.join(non_observations)}"
-                )
-        episode = {
-            "schema_version": "salience_episode.v1",
-            "episode_id": f"ep-{uuid.uuid4().hex}",
-            "event": event,
-            "record": record.as_dict(),
-            "record_sha256": _sha256_bytes(_canonical_json(record.as_dict()).encode("utf-8")),
-            "recorded_at": utc_now(),
-        }
-        self._append_episode(episode)
-        return str(episode["episode_id"])
+            self._append_episode(episode)
+            return str(episode["episode_id"])
 
     def _append_episode(self, episode: dict[str, Any]) -> None:
         with self.events_path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -131,112 +319,208 @@ class Ledger:
             os.fsync(handle.fileno())
 
     def supersede(self, old_id: str, replacement: MemoryRecord) -> None:
-        records = self.records()
-        if old_id not in records:
-            raise LedgerError(f"unknown superseded id: {old_id}")
-        if records[old_id].authority == "user_explicit":
-            raise LedgerError(
-                "user_explicit memory cannot be superseded by convenience API; "
-                "use resolve_user_ambiguity with a user_confirmation episode"
-            )
-        replacement = replace(replacement, supersedes=tuple(set(replacement.supersedes) | {old_id}))
-        old = replace(records[old_id], status="superseded")
-        self.append(old)
-        self.append(replacement)
+        # 状态检查、old 的状态改写、两次 append 必须整体在一个临界区内：
+        # 若只锁 append 本身，两个写者可以同时读到「old 仍是 active」，
+        # 然后各写一条 superseded，第二个写者会因为状态迁移不合法而炸掉整库。
+        with self._write_lock():
+            records = self.records()
+            if old_id not in records:
+                raise LedgerError(f"unknown superseded id: {old_id}")
+            if records[old_id].authority == "user_explicit":
+                raise LedgerError(
+                    "user_explicit memory cannot be superseded by convenience API; "
+                    "use resolve_user_ambiguity with a user_confirmation episode"
+                )
+            replacement = replace(replacement, supersedes=tuple(set(replacement.supersedes) | {old_id}))
+            old = replace(records[old_id], status="superseded")
+            self.append(old)
+            self.append(replacement)
 
     def resolve_user_ambiguity(
         self, record_ids: Iterable[str], confirmed: MemoryRecord
     ) -> str:
         """Resolve user semantic ambiguity only from a new explicit confirmation episode."""
-        ids = tuple(dict.fromkeys(record_ids))
-        if len(ids) < 2:
-            raise LedgerError("user ambiguity resolution requires at least two prior records")
-        records = self.records()
-        missing = [record_id for record_id in ids if record_id not in records]
-        if missing:
-            raise LedgerError(f"unknown ambiguity records: {', '.join(missing)}")
-        prior = [records[record_id] for record_id in ids]
-        if any(item.authority != "user_explicit" for item in prior):
-            raise LedgerError("all ambiguity records must have user_explicit authority")
-        keys = {item.assertion_key for item in prior}
-        if len(keys) != 1 or None in keys:
-            raise LedgerError("ambiguity records must share one non-empty assertion_key")
-        if confirmed.authority != "user_explicit" or confirmed.assertion_key not in keys:
-            raise LedgerError("confirmed record must be user_explicit with the same assertion_key")
-        observations = self.observations()
-        confirmation_sources = [observations.get(item) for item in confirmed.source_episode_ids]
-        if not any(item and item.get("source_type") == "user_confirmation" for item in confirmation_sources):
-            raise LedgerError("resolution requires a source episode with source_type=user_confirmation")
-        if confirmed.id in records:
-            raise LedgerError(f"confirmed record id already exists: {confirmed.id}")
-        confirmed = replace(confirmed, supersedes=tuple(sorted(set(confirmed.supersedes) | set(ids))))
-        confirmed.validate()
-        payload = confirmed.as_dict()
-        episode = {
-            "schema_version": "salience_episode.v1",
-            "episode_id": f"ep-{uuid.uuid4().hex}",
-            "event": "user_ambiguity_resolution",
-            "superseded_ids": list(ids),
-            "record": payload,
-            "record_sha256": _sha256_bytes(_canonical_json(payload).encode("utf-8")),
-            "recorded_at": utc_now(),
-        }
-        self._append_episode(episode)
-        return str(episode["episode_id"])
+        # 前置校验（同 assertion_key、authority、user_confirmation 来源）与追加
+        # 必须同处一个临界区：否则两个写者可以同时通过「confirmed.id 不存在」
+        # 的检查，各追加一条同 id 记录，之后整库因 id 重写不可读。
+        with self._write_lock():
+            ids = tuple(dict.fromkeys(record_ids))
+            if len(ids) < 2:
+                raise LedgerError("user ambiguity resolution requires at least two prior records")
+            records = self.records()
+            missing = [record_id for record_id in ids if record_id not in records]
+            if missing:
+                raise LedgerError(f"unknown ambiguity records: {', '.join(missing)}")
+            prior = [records[record_id] for record_id in ids]
+            if any(item.authority != "user_explicit" for item in prior):
+                raise LedgerError("all ambiguity records must have user_explicit authority")
+            keys = {item.assertion_key for item in prior}
+            if len(keys) != 1 or None in keys:
+                raise LedgerError("ambiguity records must share one non-empty assertion_key")
+            if confirmed.authority != "user_explicit" or confirmed.assertion_key not in keys:
+                raise LedgerError("confirmed record must be user_explicit with the same assertion_key")
+            observations = self.observations()
+            confirmation_sources = [observations.get(item) for item in confirmed.source_episode_ids]
+            if not any(item and item.get("source_type") == "user_confirmation" for item in confirmation_sources):
+                raise LedgerError("resolution requires a source episode with source_type=user_confirmation")
+            if confirmed.id in records:
+                raise LedgerError(f"confirmed record id already exists: {confirmed.id}")
+            confirmed = replace(confirmed, supersedes=tuple(sorted(set(confirmed.supersedes) | set(ids))))
+            confirmed.validate()
+            payload = confirmed.as_dict()
+            episode = {
+                "schema_version": "salience_episode.v1",
+                "episode_id": f"ep-{uuid.uuid4().hex}",
+                "event": "user_ambiguity_resolution",
+                "superseded_ids": list(ids),
+                "record": payload,
+                "record_sha256": _sha256_bytes(_canonical_json(payload).encode("utf-8")),
+                "recorded_at": utc_now(),
+            }
+            self._append_episode(episode)
+            return str(episode["episode_id"])
+
+    def _read_journal(self) -> JournalSnapshot:
+        """读一次 events 文件，返回 records / episode_ids / observations 同源的快照。
+
+        调用方若需要多个投影（审计 + 发布），必须共用同一个快照对象，
+        不得在中间再次调用 records()/episode_ids()/observations() 去偷读实时文件。
+
+        2026-10-22 加锁：_append_episode 用文本模式 write 追加，一条长记录
+        可能分多次落盘。读者若在写者写到一半时 read_bytes，会拿到半行，
+        _parse_journal 随后按 JSONDecodeError 抛错——表现为「读库偶发失败」。
+        与写者共用同一把写锁后，读到的一定是完整行。锁可重入，
+        append() 内部调用 records() 不会死锁。
+        """
+        with self._write_lock():
+            self.init()
+            return self._parse_journal(self.events_path.read_bytes())
+
+    def _parse_journal(self, raw: bytes) -> JournalSnapshot:
+        """从一份字节解析出全部投影；解析规则与 records()/observations() 保持一致。"""
+        latest: dict[str, MemoryRecord] = {}
+        episode_ids: set[str] = set()
+        observations: dict[str, dict[str, Any]] = {}
+        captured_at = parse_timestamp(utc_now())
+        # 必须按物理行分隔（只认 \n），不能用 str.splitlines()：
+        # splitlines() 还会在 U+0085/U+2028/U+2029 等 Unicode 行分隔符处切分，
+        # 而 _canonical_json(ensure_ascii=False) 会把它们原样写进 JSON 字符串内部，
+        # 那样会把一条合法记录劈成两半。_append_episode 用 newline="\n" 写入，
+        # 因此文件里只可能以 \n 分行，\r 仅可能来自外部写入，故仅剥离行尾 \r。
+        for line_number, raw_line in enumerate(raw.decode("utf-8").split("\n"), 1):
+            raw_line = raw_line.rstrip("\r")
+            if not raw_line.strip():
+                continue
+            try:
+                episode = json.loads(raw_line)
+                episode_id = str(episode["episode_id"])
+                episode_ids.add(episode_id)
+                if episode.get("event") == "observation":
+                    expected_content = _sha256_bytes(str(episode["content"]).encode("utf-8"))
+                    if episode.get("content_sha256") != expected_content:
+                        raise LedgerError(f"observation hash mismatch at line {line_number}")
+                    observations[episode_id] = episode
+                    continue
+                if episode.get("event") == "user_ambiguity_resolution":
+                    for old_id in episode["superseded_ids"]:
+                        if old_id not in latest:
+                            raise LedgerError(
+                                f"resolution references unknown prior record {old_id} "
+                                f"at line {line_number}"
+                            )
+                        latest[old_id] = replace(latest[old_id], status="superseded")
+                record_data = episode["record"]
+                expected = _sha256_bytes(_canonical_json(record_data).encode("utf-8"))
+                if episode.get("record_sha256") != expected:
+                    raise LedgerError(f"episode record hash mismatch at line {line_number}")
+                record = MemoryRecord.from_dict(record_data)
+            except (KeyError, ValueError, json.JSONDecodeError) as exc:
+                raise LedgerError(f"invalid episode at line {line_number}: {exc}") from exc
+            existing = latest.get(record.id)
+            if existing is not None:
+                old = existing.as_dict()
+                new = record.as_dict()
+                old_status, new_status = old.pop("status"), new.pop("status")
+                if old != new:
+                    raise LedgerError(
+                        f"immutable record {record.id} was rewritten at line {line_number}"
+                    )
+                allowed = {
+                    "active": {"resolved", "superseded", "rejected", "archived"},
+                    "accepted": {"resolved", "superseded", "rejected", "archived"},
+                }
+                if new_status not in allowed.get(old_status, set()):
+                    raise LedgerError(
+                        f"invalid projected status transition for {record.id} at line {line_number}: "
+                        f"{old_status} -> {new_status}"
+                    )
+            latest[record.id] = record
+        return JournalSnapshot(
+            raw=raw,
+            source_sha256=_sha256_bytes(raw),
+            records=latest,
+            episode_ids=frozenset(episode_ids),
+            observations=observations,
+            captured_at=captured_at,
+        )
 
     def records(self) -> dict[str, MemoryRecord]:
-        self.init()
-        latest: dict[str, MemoryRecord] = {}
-        with self.events_path.open("r", encoding="utf-8") as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if not raw.strip():
-                    continue
-                try:
-                    episode = json.loads(raw)
-                    if episode.get("event") == "observation":
-                        expected_content = _sha256_bytes(str(episode["content"]).encode("utf-8"))
-                        if episode.get("content_sha256") != expected_content:
-                            raise LedgerError(f"observation hash mismatch at line {line_number}")
+        with self._write_lock():
+            self.init()
+            latest: dict[str, MemoryRecord] = {}
+            with self.events_path.open("r", encoding="utf-8") as handle:
+                for line_number, raw in enumerate(handle, 1):
+                    if not raw.strip():
                         continue
-                    if episode.get("event") == "user_ambiguity_resolution":
-                        for old_id in episode["superseded_ids"]:
-                            if old_id not in latest:
-                                raise LedgerError(
-                                    f"resolution references unknown prior record {old_id} at line {line_number}"
-                                )
-                            latest[old_id] = replace(latest[old_id], status="superseded")
-                    record_data = episode["record"]
-                    expected = _sha256_bytes(_canonical_json(record_data).encode("utf-8"))
-                    if episode.get("record_sha256") != expected:
-                        raise LedgerError(f"episode record hash mismatch at line {line_number}")
-                    record = MemoryRecord.from_dict(record_data)
-                except (KeyError, ValueError, json.JSONDecodeError) as exc:
-                    raise LedgerError(f"invalid episode at line {line_number}: {exc}") from exc
-                existing = latest.get(record.id)
-                if existing is not None:
-                    old = existing.as_dict()
-                    new = record.as_dict()
-                    old_status, new_status = old.pop("status"), new.pop("status")
-                    if old != new:
-                        raise LedgerError(
-                            f"immutable record {record.id} was rewritten at line {line_number}"
-                        )
-                    allowed = {
-                        "active": {"resolved", "superseded", "rejected", "archived"},
-                        "accepted": {"resolved", "superseded", "rejected", "archived"},
-                    }
-                    if new_status not in allowed.get(old_status, set()):
-                        raise LedgerError(
-                            f"invalid projected status transition for {record.id} at line {line_number}: "
-                            f"{old_status} -> {new_status}"
-                        )
-                latest[record.id] = record
-        return latest
+                    try:
+                        episode = json.loads(raw)
+                        if episode.get("event") == "observation":
+                            expected_content = _sha256_bytes(str(episode["content"]).encode("utf-8"))
+                            if episode.get("content_sha256") != expected_content:
+                                raise LedgerError(f"observation hash mismatch at line {line_number}")
+                            continue
+                        if episode.get("event") == "user_ambiguity_resolution":
+                            for old_id in episode["superseded_ids"]:
+                                if old_id not in latest:
+                                    raise LedgerError(
+                                        f"resolution references unknown prior record {old_id} at line {line_number}"
+                                    )
+                                latest[old_id] = replace(latest[old_id], status="superseded")
+                        record_data = episode["record"]
+                        expected = _sha256_bytes(_canonical_json(record_data).encode("utf-8"))
+                        if episode.get("record_sha256") != expected:
+                            raise LedgerError(f"episode record hash mismatch at line {line_number}")
+                        record = MemoryRecord.from_dict(record_data)
+                    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+                        raise LedgerError(f"invalid episode at line {line_number}: {exc}") from exc
+                    existing = latest.get(record.id)
+                    if existing is not None:
+                        old = existing.as_dict()
+                        new = record.as_dict()
+                        old_status, new_status = old.pop("status"), new.pop("status")
+                        if old != new:
+                            raise LedgerError(
+                                f"immutable record {record.id} was rewritten at line {line_number}"
+                            )
+                        allowed = {
+                            "active": {"resolved", "superseded", "rejected", "archived"},
+                            "accepted": {"resolved", "superseded", "rejected", "archived"},
+                        }
+                        if new_status not in allowed.get(old_status, set()):
+                            raise LedgerError(
+                                f"invalid projected status transition for {record.id} at line {line_number}: "
+                                f"{old_status} -> {new_status}"
+                            )
+                    latest[record.id] = record
+            return latest
 
-    def audit(self, *, completion: bool = False) -> list[str]:
-        records = self.records()
+    def audit(
+        self, *, completion: bool = False, snapshot: JournalSnapshot | None = None
+    ) -> list[str]:
+        snap = snapshot if snapshot is not None else self._read_journal()
+        records = snap.records
         issues: list[str] = []
-        now = parse_timestamp(utc_now())
+        now = snap.captured_at
         active = {
             key: value
             for key, value in records.items()
@@ -275,15 +559,14 @@ class Ledger:
         if len(current_tasks) > 1:
             issues.append("multiple active current_task records")
 
+        known_episodes = snap.episode_ids
         for record in active.values():
             for target in (*record.supersedes, *record.conflicts_with):
                 if target not in records:
                     issues.append(f"{record.id} references missing record {target}")
-            if record.source_episode_ids:
-                known = self.episode_ids()
-                for episode_id in record.source_episode_ids:
-                    if episode_id not in known:
-                        issues.append(f"{record.id} references missing episode {episode_id}")
+            for episode_id in record.source_episode_ids:
+                if episode_id not in known_episodes:
+                    issues.append(f"{record.id} references missing episode {episode_id}")
 
         rejections = {
             record.assertion_key: record
@@ -317,112 +600,126 @@ class Ledger:
         return True
 
     def episode_ids(self) -> set[str]:
-        self.init()
-        ids: set[str] = set()
-        with self.events_path.open("r", encoding="utf-8") as handle:
-            for raw in handle:
-                if raw.strip():
-                    ids.add(str(json.loads(raw)["episode_id"]))
-        return ids
+        with self._write_lock():
+            self.init()
+            ids: set[str] = set()
+            with self.events_path.open("r", encoding="utf-8") as handle:
+                for raw in handle:
+                    if raw.strip():
+                        ids.add(str(json.loads(raw)["episode_id"]))
+            return ids
 
     def observations(self) -> dict[str, dict[str, Any]]:
-        self.init()
-        result: dict[str, dict[str, Any]] = {}
-        with self.events_path.open("r", encoding="utf-8") as handle:
-            for line_number, raw in enumerate(handle, 1):
-                if not raw.strip():
-                    continue
-                episode = json.loads(raw)
-                if episode.get("event") != "observation":
-                    continue
-                expected = _sha256_bytes(str(episode["content"]).encode("utf-8"))
-                if episode.get("content_sha256") != expected:
-                    raise LedgerError(f"observation hash mismatch at line {line_number}")
-                result[str(episode["episode_id"])] = episode
-        return result
+        with self._write_lock():
+            self.init()
+            result: dict[str, dict[str, Any]] = {}
+            with self.events_path.open("r", encoding="utf-8") as handle:
+                for line_number, raw in enumerate(handle, 1):
+                    if not raw.strip():
+                        continue
+                    episode = json.loads(raw)
+                    if episode.get("event") != "observation":
+                        continue
+                    expected = _sha256_bytes(str(episode["content"]).encode("utf-8"))
+                    if episode.get("content_sha256") != expected:
+                        raise LedgerError(f"observation hash mismatch at line {line_number}")
+                    result[str(episode["episode_id"])] = episode
+            return result
 
     def clarification_packets(self) -> list[dict[str, Any]]:
-        """Return both user wordings and sources; never choose the latest statement."""
-        records = self.records()
-        observations = self.observations()
-        active = [
-            item for item in records.values()
-            if item.status in ACTIVE_STATUSES and item.authority == "user_explicit"
-        ]
-        groups: dict[str, list[MemoryRecord]] = {}
-        for item in active:
-            if item.assertion_key:
-                groups.setdefault(item.assertion_key, []).append(item)
-        packets: list[dict[str, Any]] = []
-        for key, group in sorted(groups.items()):
-            values = {_canonical_json(item.value) for item in group}
-            explicit_links = any(
-                target in {candidate.id for candidate in group}
-                for item in group for target in item.conflicts_with
-            )
-            if len(values) <= 1 and not explicit_links:
-                continue
-            statements = []
-            for item in sorted(group, key=lambda value: (value.known_at, value.id)):
-                statements.append({
-                    "record_id": item.id,
-                    "text": item.text,
-                    "value": item.value,
-                    "known_at": item.known_at,
-                    "sources": [
-                        {
-                            "episode_id": source_id,
-                            "content": observations.get(source_id, {}).get("content"),
-                            "source_ref": observations.get(source_id, {}).get("source_ref"),
-                        }
-                        for source_id in item.source_episode_ids
-                    ],
+        with self._write_lock():
+            """Return both user wordings and sources; never choose the latest statement."""
+            records = self.records()
+            observations = self.observations()
+            active = [
+                item for item in records.values()
+                if item.status in ACTIVE_STATUSES and item.authority == "user_explicit"
+            ]
+            groups: dict[str, list[MemoryRecord]] = {}
+            for item in active:
+                if item.assertion_key:
+                    groups.setdefault(item.assertion_key, []).append(item)
+            packets: list[dict[str, Any]] = []
+            for key, group in sorted(groups.items()):
+                values = {_canonical_json(item.value) for item in group}
+                explicit_links = any(
+                    target in {candidate.id for candidate in group}
+                    for item in group for target in item.conflicts_with
+                )
+                if len(values) <= 1 and not explicit_links:
+                    continue
+                statements = []
+                for item in sorted(group, key=lambda value: (value.known_at, value.id)):
+                    statements.append({
+                        "record_id": item.id,
+                        "text": item.text,
+                        "value": item.value,
+                        "known_at": item.known_at,
+                        "sources": [
+                            {
+                                "episode_id": source_id,
+                                "content": observations.get(source_id, {}).get("content"),
+                                "source_ref": observations.get(source_id, {}).get("source_ref"),
+                            }
+                            for source_id in item.source_episode_ids
+                        ],
+                    })
+                packets.append({
+                    "assertion_key": key,
+                    "status": "USER_CONFIRMATION_REQUIRED",
+                    "statements": statements,
+                    "allowed_resolution": ["supersede", "scope_split", "withdraw_both"],
                 })
-            packets.append({
-                "assertion_key": key,
-                "status": "USER_CONFIRMATION_REQUIRED",
-                "statements": statements,
-                "allowed_resolution": ["supersede", "scope_split", "withdraw_both"],
-            })
-        return packets
+            return packets
 
     def build(self) -> dict[str, Any]:
-        issues = self.audit()
-        if issues:
-            raise LedgerError("build refused:\n- " + "\n- ".join(issues))
-        records = self.records()
-        source_hash = _sha256_file(self.events_path)
-        generation_id = f"gen-{utc_now().replace(':', '').replace('-', '')}-{source_hash[:12]}"
-        target = self.generations / generation_id
-        if target.exists():
-            return self._read_json(target / "manifest.json")
-        target.mkdir(parents=True)
+        """审计并发布一代不可变快照。
 
-        now = parse_timestamp(utc_now())
-        effective_records = [item for item in records.values() if self._is_effective(item, now)]
-        core_text = self._render_core(effective_records)
-        (target / "CORE_MEMORY.md").write_text(core_text, encoding="utf-8", newline="\n")
-        self._write_sqlite(target / "memory.sqlite", effective_records)
-        manifest = {
-            "schema_version": "salience_generation.v1",
-            "generation_id": generation_id,
-            "built_at": utc_now(),
-            "source_sha256": source_hash,
-            "record_count": len(records),
-            "files": {
-                "CORE_MEMORY.md": _sha256_file(target / "CORE_MEMORY.md"),
-                "memory.sqlite": _sha256_file(target / "memory.sqlite"),
-            },
-        }
-        self._write_json_atomic(target / "manifest.json", manifest)
-        pointer = {
-            "schema_version": "salience_pointer.v1",
-            "generation_id": generation_id,
-            "generation_path": str(target.relative_to(self.root)).replace("\\", "/"),
-            "manifest_sha256": _sha256_file(target / "manifest.json"),
-        }
-        self._write_json_atomic(self.current_path, pointer)
-        return manifest
+        2026-10-22 加锁：原先「target.exists() 判空 → target.mkdir」之间没有保护，
+        两个进程对同一 source 并发 build 会算出同一个 generation_id，
+        然后同时往同一目录写 CORE_MEMORY.md / memory.sqlite，内容互相覆盖；
+        后到的进程还可能读到尚未写完的 manifest.json 而抛 FileNotFoundError。
+        整段持写锁后，检查-创建-写文件-切指针成为一个原子段。
+        持锁时间包含一次 sqlite 写入，但 build 是低频操作，可以接受。
+        """
+        with self._write_lock():
+            snap = self._read_journal()
+            issues = self.audit(snapshot=snap)
+            if issues:
+                raise LedgerError("build refused:\n- " + "\n- ".join(issues))
+            records = snap.records
+            source_hash = snap.source_sha256
+            generation_id = f"gen-{utc_now().replace(':', '').replace('-', '')}-{source_hash[:12]}"
+            target = self.generations / generation_id
+            if target.exists():
+                return self._read_json(target / "manifest.json")
+            target.mkdir(parents=True)
+
+            now = snap.captured_at
+            effective_records = [item for item in records.values() if self._is_effective(item, now)]
+            core_text = self._render_core(effective_records)
+            (target / "CORE_MEMORY.md").write_text(core_text, encoding="utf-8", newline="\n")
+            self._write_sqlite(target / "memory.sqlite", effective_records)
+            manifest = {
+                "schema_version": "salience_generation.v1",
+                "generation_id": generation_id,
+                "built_at": utc_now(),
+                "source_sha256": source_hash,
+                "record_count": len(records),
+                "files": {
+                    "CORE_MEMORY.md": _sha256_file(target / "CORE_MEMORY.md"),
+                    "memory.sqlite": _sha256_file(target / "memory.sqlite"),
+                },
+            }
+            self._write_json_atomic(target / "manifest.json", manifest)
+            pointer = {
+                "schema_version": "salience_pointer.v1",
+                "generation_id": generation_id,
+                "generation_path": str(target.relative_to(self.root)).replace("\\", "/"),
+                "manifest_sha256": _sha256_file(target / "manifest.json"),
+            }
+            self._write_json_atomic(self.current_path, pointer)
+            return manifest
 
     def verify_current(self) -> dict[str, Any]:
         if not self.current_path.exists():
